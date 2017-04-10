@@ -34,10 +34,17 @@ typedef struct _atfork_callback {
     struct _atfork_callback *next;
 } atfork_callback;
 
+typedef struct _atfork_watchable {
+    PyObject *item;
+    struct _atfork_watchable *next;
+} atfork_watchable;
+
 typedef struct {
     atfork_callback *callback_pre_fork;
     atfork_callback *callback_after_fork_parent;
     atfork_callback *callback_after_fork_child;
+
+    atfork_watchable *watchlist;
 
     int hooks_registered;
     int hooks_enabled;
@@ -197,6 +204,16 @@ static int atfork_clear(PyObject *self) {
 
     modstate->callback_pre_fork = modstate->callback_after_fork_parent = modstate->callback_after_fork_child = NULL;
 
+    while (modstate->watchlist != NULL) {
+        atfork_watchable *item = modstate->watchlist;
+        modstate->watchlist = item->next;
+
+        Py_DECREF(item->item);
+        PyMem_Free(item);
+    }
+
+    modstate->watchlist = NULL;
+
     return 0;
 }
 
@@ -209,6 +226,10 @@ static void atfork_free(PyObject *self) {
 
 
 /* Helper functions */
+
+PyThread_type_lock _get_lock_from_textiowrapper(PyObject *object) {
+    return ((buffered*) ((textio*) object)->buffer)->lock;
+}
 
 /**
  * Obtain the locks for stdout and stderr
@@ -235,8 +256,8 @@ int _get_io_locks(PyThread_type_lock *stdout_lock, PyThread_type_lock *stderr_lo
 
     // sys.std{out,err} is wrapped in `_io::TextIOWrapper` which contains a pointer
     // to the buffer object itself.
-    *stdout_lock = ((buffered*) ((textio*) sys_stdout)->buffer)->lock;
-    *stderr_lock = ((buffered*) ((textio*) sys_stderr)->buffer)->lock;
+    *stdout_lock = _get_lock_from_textiowrapper(sys_stdout);
+    *stderr_lock = _get_lock_from_textiowrapper(sys_stderr);
 
     return 0;
 }
@@ -279,6 +300,15 @@ void _pre_fork() {
 
     if (LOCK_ACQUIRED(stderr_lock)) {
         fprintf(stderr, "possible deadlock for sys.stderr\n");
+    }
+
+    atfork_watchable *current = modstate->watchlist;
+    while (current != NULL) {
+        PyThread_type_lock lock = _get_lock_from_textiowrapper(current->item);
+        if (LOCK_ACQUIRED(lock)) {
+            fprintf(stderr, "possible deadlock for file descriptor\n");
+        }
+        current = current->next;
     }
 
     run_callbacks(modstate->callback_pre_fork);
@@ -344,6 +374,16 @@ void _after_fork_child() {
         PyThread_release_lock(stderr_lock);
     }
 
+    atfork_watchable *current = modstate->watchlist;
+    while (current != NULL) {
+        PyThread_type_lock lock = _get_lock_from_textiowrapper(current->item);
+        if (LOCK_ACQUIRED(lock)) {
+            fprintf(stderr, "deadlock for file descriptor\n");
+            PyThread_release_lock(lock);
+        }
+        current = current->next;
+    }
+
     run_callbacks(modstate->callback_after_fork_child);
 }
 
@@ -396,6 +436,38 @@ PyObject* _deregister_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
     Py_RETURN_NONE;
 }
 
+extern PyTypeObject PyTextIOWrapper_Type;
+
+PyObject* _watch_textiowrapper(PyObject *self, PyObject *args, PyObject *Py_UNUSED(kwargs)) {
+    module_state *modstate = MODULE_STATE(self);
+
+    if (PyTuple_GET_SIZE(args) != 1) {
+        PyErr_SetString(PyExc_TypeError,
+                        "function takes exactly 1 argument");
+        return NULL;
+    }
+
+    PyObject *item = PyTuple_GetItem(args, 0);
+
+    if (Py_TYPE(item) != &PyTextIOWrapper_Type) {
+        PyErr_SetString(PyExc_ValueError, "expecting object wrapped in TextIOWrapper");
+        return NULL;
+    }
+
+    atfork_watchable *watchable = PyMem_Malloc(sizeof(atfork_watchable));
+    if (watchable == NULL) {
+        return PyErr_NoMemory();
+    }
+
+    watchable->item = item;
+    watchable->next = modstate->watchlist;
+    modstate->watchlist = watchable;
+
+    Py_INCREF(item);
+
+    Py_RETURN_NONE;
+}
+
 
 /* Module definition */
 
@@ -405,6 +477,7 @@ static struct PyMethodDef atfork_lock_release_methods[] = {
         { "pre_fork", (PyCFunction) add_pre_fork_callback, METH_VARARGS, ""},
         { "after_fork_parent", (PyCFunction) add_post_fork_parent_callback, METH_VARARGS, ""},
         { "after_fork_child", (PyCFunction) add_post_fork_child_callback, METH_VARARGS, ""},
+        { "watch", (PyCFunction) _watch_textiowrapper, METH_VARARGS, ""},
         { NULL }
 };
 
@@ -433,6 +506,7 @@ PyMODINIT_FUNC PyInit_atfork_lock_release(void) {
 
     module_state *modstate = MODULE_STATE(module);
     modstate->callback_pre_fork = modstate->callback_after_fork_parent = modstate->callback_after_fork_child = NULL;
+    modstate->watchlist = NULL;
     modstate->hooks_enabled = modstate->hooks_registered = 0;
 
     return module;
