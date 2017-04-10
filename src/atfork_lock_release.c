@@ -13,16 +13,199 @@
 #include <pthread.h>
 
 
+/* Forward declaration of module object */
+static struct PyModuleDef atfork_lock_release_module;
+
+
 /* Helper macros */
 
 #define CHECK_STATUS(name)  if (status != 0) { fprintf(stderr, \
     "%s: %s\n", name, strerror(status)); error = 1; }
 
-#define CHECK_HOOKS_ENABLED() if (! _hooks_enabled) { return; }
-
 // First field of the pthread lock structure is a char. In order to access it
 // we cast the lock to char* and dereference afterwards.
 #define LOCK_ACQUIRED(_lock) (*((char*)(_lock)))
+
+
+/* Module state */
+
+typedef struct _atfork_callback {
+    PyObject *callback;
+    struct _atfork_callback *next;
+} atfork_callback;
+
+typedef struct {
+    atfork_callback *callback_pre_fork;
+    atfork_callback *callback_after_fork_parent;
+    atfork_callback *callback_after_fork_child;
+
+    int hooks_registered;
+    int hooks_enabled;
+} module_state;
+
+#define MODULE_STATE(mod) ((module_state*)PyModule_GetState(mod))
+
+/* Callback utils */
+
+/**
+ * Template method for adding atfork callbacks
+ * @param args Argument tuple provided to the function
+ * @param result Pointer to a result pointer which will store the created callback object
+ * @return
+ */
+static int add_callback(PyObject *args, atfork_callback **result) {
+    PyObject *callback;
+    atfork_callback *af_callback = NULL;
+
+    if (PyTuple_GET_SIZE(args) != 1) {
+        PyErr_SetString(PyExc_TypeError,
+                        "atfork() takes exactly 1 argument");
+        return 1;
+    }
+
+    callback = PyTuple_GetItem(args, 0);
+
+    if (! PyCallable_Check(callback)) {
+        PyErr_SetString(PyExc_ValueError, "atfork() argument must be callable");
+        return 1;
+    }
+
+    af_callback = PyMem_Malloc(sizeof(atfork_callback));
+    if (af_callback == NULL) {
+        PyErr_NoMemory();
+        return 1;
+    }
+
+    af_callback->callback = callback;
+    Py_INCREF(callback);
+
+    *result = af_callback;
+
+    return 0;
+}
+
+/**
+ * Add a callback for the parent process pre fork
+ */
+static PyObject *add_pre_fork_callback(PyObject *self, PyObject *args, PyObject *Py_UNUSED(kwargs)) {
+    atfork_callback *callback;
+    module_state *modstate = MODULE_STATE(self);
+
+    if (add_callback(args, &callback)) {
+        return NULL;
+    }
+
+    callback->next = modstate->callback_pre_fork;
+    modstate->callback_pre_fork = callback;
+
+    Py_RETURN_NONE;
+}
+
+/**
+ * Add a callback for the parent process after fork
+ */
+static PyObject *add_post_fork_parent_callback(PyObject *self, PyObject *args, PyObject *Py_UNUSED(kwargs)) {
+    atfork_callback *callback;
+    module_state *modstate = MODULE_STATE(self);
+
+    if (add_callback(args, &callback)) {
+        return NULL;
+    }
+
+    callback->next = modstate->callback_after_fork_parent;
+    modstate->callback_after_fork_parent = callback;
+
+    Py_RETURN_NONE;
+}
+
+/**
+ * Add a callback for the child process after fork
+ */
+static PyObject *add_post_fork_child_callback(PyObject *self, PyObject *args, PyObject *Py_UNUSED(kwargs)) {
+    atfork_callback *callback;
+    module_state *modstate = MODULE_STATE(self);
+
+    if (add_callback(args, &callback)) {
+        return NULL;
+    }
+
+    callback->next = modstate->callback_after_fork_child;
+    modstate->callback_after_fork_child = callback;
+
+    Py_RETURN_NONE;
+}
+
+/**
+ * Execute callbacks starting with `callback`
+ * @param callback First item of the linked list
+ */
+static void run_callbacks(atfork_callback *callback) {
+    PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
+
+    while (callback != NULL) {
+        PyObject *result = PyObject_Call(callback->callback, Py_None, NULL);
+        Py_XDECREF(result);
+
+        // NULL indicates an exception being thrown.
+        if (result == NULL) {
+            if (exc_type) {
+                Py_DECREF(exc_type);
+                Py_XDECREF(exc_value);
+                Py_XDECREF(exc_tb);
+            }
+            PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+            if (!PyErr_ExceptionMatches(PyExc_SystemExit)) {
+                PySys_WriteStderr("Error in atfork handler:\n");
+                PyErr_NormalizeException(&exc_type, &exc_value, &exc_tb);
+                PyErr_Display(exc_type, exc_value, exc_tb);
+            }
+        }
+
+        callback = callback->next;
+    }
+
+    // Restore last exception
+    if (exc_type) {
+        PyErr_Restore(exc_type, exc_value, exc_tb);
+    }
+}
+
+/**
+ * Free callback data
+ *
+ * @param callback First item of linked callback list
+ */
+static void clear_callbacks(atfork_callback *callback) {
+    while (callback != NULL) {
+        atfork_callback *item = callback;
+        callback = callback->next;
+
+        Py_DECREF(item->callback);
+        PyMem_Free(item);
+    }
+}
+
+/**
+ * Module cleanup
+ */
+static int atfork_clear(PyObject *self) {
+    module_state *modstate = MODULE_STATE(self);
+
+    clear_callbacks(modstate->callback_pre_fork);
+    clear_callbacks(modstate->callback_after_fork_parent);
+    clear_callbacks(modstate->callback_after_fork_child);
+
+    modstate->callback_pre_fork = modstate->callback_after_fork_parent = modstate->callback_after_fork_child = NULL;
+
+    return 0;
+}
+
+/**
+ * Module cleanup
+ */
+static void atfork_free(PyObject *self) {
+    atfork_clear(self);
+}
 
 
 /* Helper functions */
@@ -61,9 +244,6 @@ int _get_io_locks(PyThread_type_lock *stdout_lock, PyThread_type_lock *stderr_lo
 
 /* Module locals */
 
-int _hooks_registered = 0;
-int _hooks_enabled = 0;
-
 /**
  * pre-fork hook
  * 
@@ -71,7 +251,13 @@ int _hooks_enabled = 0;
  * streams is locked pre-fork, a warning is written to stderr.
  */
 void _pre_fork() {
-    CHECK_HOOKS_ENABLED();
+    PyObject *module = PyState_FindModule(&atfork_lock_release_module);
+    if (module == NULL)
+        return;
+    module_state *modstate = MODULE_STATE(module);
+
+    if (! modstate->hooks_enabled)
+        return;
 
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
     if (_get_io_locks(&stdout_lock, &stderr_lock)) {
@@ -94,6 +280,8 @@ void _pre_fork() {
     if (LOCK_ACQUIRED(stderr_lock)) {
         fprintf(stderr, "possible deadlock for sys.stderr\n");
     }
+
+    run_callbacks(modstate->callback_pre_fork);
 }
 
 /**
@@ -102,7 +290,15 @@ void _pre_fork() {
  * Currently no-op as the parent locks should be freed automatically.
  */
 void _after_fork_parent() {
-    CHECK_HOOKS_ENABLED();
+    PyObject *module = PyState_FindModule(&atfork_lock_release_module);
+    if (module == NULL)
+        return;
+    module_state *modstate = MODULE_STATE(module);
+
+    if (! modstate->hooks_enabled)
+        return;
+
+    run_callbacks(modstate->callback_after_fork_parent);
 }
 
 /**
@@ -112,7 +308,13 @@ void _after_fork_parent() {
  * locks.
  */
 void _after_fork_child() {
-    CHECK_HOOKS_ENABLED();
+    PyObject *module = PyState_FindModule(&atfork_lock_release_module);
+    if (module == NULL)
+        return;
+    module_state *modstate = MODULE_STATE(module);
+
+    if (! modstate->hooks_enabled)
+        return;
 
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
     if (_get_io_locks(&stdout_lock, &stderr_lock)) {
@@ -141,6 +343,8 @@ void _after_fork_child() {
         fprintf(stderr, "deadlock for sys.stderr, releasing\n");
         PyThread_release_lock(stderr_lock);
     }
+
+    run_callbacks(modstate->callback_after_fork_child);
 }
 
 
@@ -149,10 +353,11 @@ void _after_fork_child() {
 /**
  * Register the module's atfork hooks.
  */
-PyObject* _register_hooks(PyObject *Py_UNUSED(ignored), PyObject *Py_UNUSED(args)) {
+PyObject* _register_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
     int status, error = 0;
+    module_state *modstate = MODULE_STATE(self);
 
-    if (!_hooks_registered) {
+    if (! modstate->hooks_registered) {
         status = pthread_atfork(_pre_fork, _after_fork_parent, _after_fork_child);
         CHECK_STATUS("pthread_atfork");
 
@@ -163,10 +368,10 @@ PyObject* _register_hooks(PyObject *Py_UNUSED(ignored), PyObject *Py_UNUSED(args
             return NULL;
         }
 
-        _hooks_registered = 1;
+        modstate->hooks_registered = 1;
     }
 
-    _hooks_enabled = 1;
+    modstate->hooks_enabled = 1;
 
     Py_RETURN_NONE;
 }
@@ -175,8 +380,10 @@ PyObject* _register_hooks(PyObject *Py_UNUSED(ignored), PyObject *Py_UNUSED(args
 /**
  * Deregister the module's atfork hooks.
  */
-PyObject* _deregister_hooks(PyObject *Py_UNUSED(ignored), PyObject *Py_UNUSED(args)) {
-    if (! _hooks_registered) {
+PyObject* _deregister_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
+    module_state *modstate = MODULE_STATE(self);
+
+    if (! modstate->hooks_registered) {
         PyErr_SetString(PyExc_RuntimeError, "hooks are not registered yet");
         return NULL;
     }
@@ -184,7 +391,7 @@ PyObject* _deregister_hooks(PyObject *Py_UNUSED(ignored), PyObject *Py_UNUSED(ar
     // The pthread library does not provide a way for us to deregister the
     // hooks, so we have to use a flag instead.
 
-    _hooks_enabled = 0;
+    modstate->hooks_enabled = 0;
 
     Py_RETURN_NONE;
 }
@@ -195,6 +402,9 @@ PyObject* _deregister_hooks(PyObject *Py_UNUSED(ignored), PyObject *Py_UNUSED(ar
 static struct PyMethodDef atfork_lock_release_methods[] = {
         { "register", (PyCFunction) _register_hooks, METH_NOARGS, "register atfork handlers"},
         { "deregister", (PyCFunction) _deregister_hooks, METH_NOARGS, "disable atfork handlers"},
+        { "pre_fork", (PyCFunction) add_pre_fork_callback, METH_VARARGS, ""},
+        { "after_fork_parent", (PyCFunction) add_post_fork_parent_callback, METH_VARARGS, ""},
+        { "after_fork_child", (PyCFunction) add_post_fork_child_callback, METH_VARARGS, ""},
         { NULL }
 };
 
@@ -203,12 +413,12 @@ static struct PyModuleDef atfork_lock_release_module = {
         PyModuleDef_HEAD_INIT,
         "atfork_lock_release",
         NULL,
-        -1,
+        sizeof(module_state),
         atfork_lock_release_methods,
         NULL,
         NULL,
-        NULL,
-        NULL
+        atfork_clear,
+        (freefunc) atfork_free
 };
 
 
@@ -220,6 +430,10 @@ PyMODINIT_FUNC PyInit_atfork_lock_release(void) {
     if (! module) {
         return NULL;
     }
+
+    module_state *modstate = MODULE_STATE(module);
+    modstate->callback_pre_fork = modstate->callback_after_fork_parent = modstate->callback_after_fork_child = NULL;
+    modstate->hooks_enabled = modstate->hooks_registered = 0;
 
     return module;
 }

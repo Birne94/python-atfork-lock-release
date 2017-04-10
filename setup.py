@@ -11,5 +11,7 @@ setup(
     name='atfork_lock_release',
     version='0.1',
     description='Module to provide access to posix pthread_atfork function',
-    ext_modules=[module]
+    ext_modules=[module],
+    author='Daniel Birnstiel',
+    author_email='daniel@birne.me'
 )
