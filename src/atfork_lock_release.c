@@ -199,7 +199,9 @@ static void run_callbacks(atfork_callback *callback) {
     PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
 
     while (callback != NULL) {
-        PyObject *result = PyObject_Call(callback->callback, Py_None, NULL);
+        PyObject *args = PyTuple_New(0);
+        PyObject *result = PyObject_Call(callback->callback, args, NULL);
+        Py_DECREF(args);
         Py_XDECREF(result);
 
         // NULL indicates an exception being thrown.
