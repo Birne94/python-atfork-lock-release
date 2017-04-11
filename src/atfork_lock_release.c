@@ -30,29 +30,47 @@ extern PyTypeObject PyTextIOWrapper_Type;
 // for further details.
 #if (defined(_POSIX_SEMAPHORES) && !defined(HAVE_BROKEN_POSIX_SEMAPHORES) && \
      defined(HAVE_SEM_TIMEDWAIT))
-// When using raw semaphores, we need to check if we can lock it ourselves.
 #include <semaphore.h>
 #include <errno.h>
 int _sem_lock_acquired(void *lock) {
     sem_t *sem = (sem_t*) lock;
 
-    int status = sem_trywait(sem);
-    switch (status) {
-        case EINTR:
-            // Interrupted
-            return 0;
-        case EAGAIN:
-            // Already locked
-            return 1;
-        case 0:
+    int status;
+
+    do {
+        // When using raw semaphores, we need to check if we can lock it ourselves.
+        status = sem_trywait(sem);
+        if (status == 0) {
             // Lock successful, free it again (otherwise we are causing
             // a deadlock ourselves)
-            sem_post(sem);
-            return 0;
-        default:
-            perror("sem_trywait");
-            return 0;
-    }
+            do {
+                if (sem_post(sem) == 0) {
+                    // Semaphore released, ready to go.
+                    return 0;
+                }
+
+                // Check for EINTR again, we definitely need to release this
+                // semaphore.
+            } while (errno == EINTR);
+
+            perror("sem_post");
+
+            // We were unable to release the semaphore, so we pretend is was
+            // locked from the beginning. According to the documentation there
+            // should be no way of this happening, though.
+            return 1;
+        }
+
+        if (errno == EAGAIN) {
+            // Already locked
+            return 1;
+        }
+
+        // sem_trywait might have returned EINTR, we will just try again.
+    } while (status == -1 && errno == EINTR);
+
+    perror("sem_trywait");
+    return 0;
 }
 # define LOCK_ACQUIRED(_lock) (_sem_lock_acquired(_lock))
 #else

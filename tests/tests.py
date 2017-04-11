@@ -4,6 +4,7 @@ import atfork_lock_release
 
 
 class ForkingTestCase(unittest.TestCase):
+
     def setUp(self):
         atfork_lock_release.register()
 
@@ -13,7 +14,7 @@ class ForkingTestCase(unittest.TestCase):
     def _wait_for_child(self, pid):
         _, result = os.waitpid(pid, 0)
         status, signal = (result & 0xff00) >> 8, result & 0xff
-        self.assertEqual(status, 0, "Child process return non-zero exit "
+        self.assertEqual(status, 0, "Child process returned non-zero exit "
                                     "code %d (signal %d)" % (status, signal))
 
     # ---
@@ -73,16 +74,16 @@ class ForkingTestCase(unittest.TestCase):
 
         @atfork_lock_release.pre_fork
         def pre():
-            self.fail("pre-fork hook called desprite hooks being disabled")
+            self.fail("pre-fork hook called despite hooks being disabled")
 
         @atfork_lock_release.after_fork_parent
         def post_p():
-            self.fail("post-fork for parent hook called desprite "
+            self.fail("post-fork for parent hook called despite "
                       "hooks being disabled")
 
         @atfork_lock_release.after_fork_child
         def post_c():
-            self.fail("post-fork for child hook called desprite "
+            self.fail("post-fork for child hook called despite "
                       "hooks being disabled")
 
         pid = os.fork()
