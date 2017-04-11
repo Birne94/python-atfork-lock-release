@@ -1,4 +1,4 @@
-from distutils.core import setup, Extension
+from setuptools import setup, Extension
 
 module_sources = [
     'src/atfork_lock_release.c'

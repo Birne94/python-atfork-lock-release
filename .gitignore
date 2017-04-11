@@ -58,6 +58,8 @@ dkms.conf
 # CMake files, we're not using them anyway
 CMakeLists.txt
 cmake-build-debug
+dist
+*.egg-info
 
 # Virtual environments
 venv
