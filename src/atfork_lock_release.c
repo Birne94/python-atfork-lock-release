@@ -24,9 +24,40 @@ static struct PyModuleDef atfork_lock_release_module;
 
 /* Helper macros */
 
+// If semaphores are available, we use them directly. See thread_pthread.h
+// for further details.
+#if (defined(_POSIX_SEMAPHORES) && !defined(HAVE_BROKEN_POSIX_SEMAPHORES) && \
+     defined(HAVE_SEM_TIMEDWAIT))
+// When using raw semaphores, we need to check if we can lock it ourselves.
+#include <semaphore.h>
+#include <errno.h>
+int _sem_lock_acquired(void *lock) {
+    sem_t *sem = (sem_t*) lock;
+
+    int status = sem_trywait(sem);
+    switch (status) {
+        case EINTR:
+            // Interrupted
+            return 0;
+        case EAGAIN:
+            // Already locked
+            return 1;
+        case 0:
+            // Lock successful, free it again (otherwise we are causing
+            // a deadlock ourselves)
+            sem_post(sem);
+            return 0;
+        default:
+            perror("sem_trywait");
+            return 0;
+    }
+}
+# define LOCK_ACQUIRED(_lock) (_sem_lock_acquired(_lock))
+#else
 // First field of the pthread lock structure is a char. In order to access it
 // we cast the lock to char* and dereference afterwards.
-#define LOCK_ACQUIRED(_lock) (*((char*)(_lock)))
+# define LOCK_ACQUIRED(_lock) (*((char*)(_lock)))
+#endif
 
 
 /* Module state */
@@ -260,7 +291,7 @@ int get_io_locks(PyThread_type_lock *stdout_lock, PyThread_type_lock *stderr_loc
  * Obtains and checks the io locks for possible deadlocks. If one of the io-
  * streams is locked pre-fork, a warning is written to stderr.
  */
-void _pre_fork() {
+void _pre_fork(void) {
     PyObject *module = PyState_FindModule(&atfork_lock_release_module);
     if (module == NULL)
         return;
@@ -308,7 +339,7 @@ void _pre_fork() {
  *
  * Currently no-op as the parent locks should be freed automatically.
  */
-void _after_fork_parent() {
+void _after_fork_parent(void) {
     PyObject *module = PyState_FindModule(&atfork_lock_release_module);
     if (module == NULL)
         return;
@@ -326,7 +357,7 @@ void _after_fork_parent() {
  * Checks for locked io streams which have deadlocked and releases their
  * locks.
  */
-void _after_fork_child() {
+void _after_fork_child(void) {
     PyObject *module = PyState_FindModule(&atfork_lock_release_module);
     if (module == NULL)
         return;
