@@ -1,10 +1,11 @@
 #include <Python.h>
 #include <pythread.h>
-#include "structs.h"
 
 
-#if PY_MAJOR_VERSION != 3
-# error atfork_lock_release only supports python 3 for now
+#if PY_MAJOR_VERSION == 3
+# include "structs3.h"
+#else
+# error atfork_lock_release only supports python 3
 #endif
 
 #ifndef _POSIX_THREADS
@@ -20,6 +21,7 @@
 
 /* Forward declaration of module object */
 static struct PyModuleDef atfork_lock_release_module;
+extern PyTypeObject PyTextIOWrapper_Type;
 
 
 /* Helper macros */
@@ -276,6 +278,16 @@ int get_io_locks(PyThread_type_lock *stdout_lock, PyThread_type_lock *stderr_loc
         return 1;
     }
 
+    if (Py_TYPE(sys_stdout) != &PyTextIOWrapper_Type) {
+        PyErr_Warn(PyExc_RuntimeWarning, "sys.stdout is not text based.");
+        return 1;
+    }
+
+    if (Py_TYPE(sys_stderr) != &PyTextIOWrapper_Type) {
+        PyErr_Warn(PyExc_RuntimeWarning, "sys.stderr is not text based.");
+        return 1;
+    }
+
     // sys.std{out,err} is wrapped in `_io::TextIOWrapper` which contains a pointer
     // to the buffer object itself.
     *stdout_lock = get_lock_from_textiowrapper(sys_stdout);
@@ -303,25 +315,23 @@ void _pre_fork(void) {
         return;
 
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
-    if (get_io_locks(&stdout_lock, &stderr_lock)) {
-        return;
-    }
+    if (! get_io_locks(&stdout_lock, &stderr_lock)) {
+        if (stdout_lock == NULL) {
+            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stdout lock");
+            return;
+        }
+        if (stderr_lock == NULL) {
+            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stderr lock");
+            return;
+        }
 
-    if (stdout_lock == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "unable to obtain stdout lock");
-        return;
-    }
-    if (stderr_lock == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "unable to obtain stderr lock");
-        return;
-    }
+        if (LOCK_ACQUIRED(stdout_lock)) {
+            fprintf(stderr, "possible deadlock for sys.stdout\n");
+        }
 
-    if (LOCK_ACQUIRED(stdout_lock)) {
-        fprintf(stderr, "possible deadlock for sys.stdout\n");
-    }
-
-    if (LOCK_ACQUIRED(stderr_lock)) {
-        fprintf(stderr, "possible deadlock for sys.stderr\n");
+        if (LOCK_ACQUIRED(stderr_lock)) {
+            fprintf(stderr, "possible deadlock for sys.stderr\n");
+        }
     }
 
     atfork_watchable *current = modstate->watchlist;
@@ -369,31 +379,29 @@ void _after_fork_child(void) {
         return;
 
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
-    if (get_io_locks(&stdout_lock, &stderr_lock)) {
-        return;
-    }
+    if (! get_io_locks(&stdout_lock, &stderr_lock)) {
+        if (stdout_lock == NULL) {
+            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stdout lock");
+            return;
+        }
+        if (stderr_lock == NULL) {
+            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stderr lock");
+            return;
+        }
 
-    if (stdout_lock == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "unable to obtain stdout lock");
-        return;
-    }
-    if (stderr_lock == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "unable to obtain stderr lock");
-        return;
-    }
+        if (LOCK_ACQUIRED(stdout_lock)) {
+            // directly write to stderr instead of issuing a warning, as
+            // the warning itself might cause a deadlock.
+            fprintf(stderr, "deadlock for sys.stdout, releasing\n");
+            PyThread_release_lock(stdout_lock);
+        }
 
-    if (LOCK_ACQUIRED(stdout_lock)) {
-        // directly write to stderr instead of issuing a warning, as
-        // the warning itself might cause a deadlock.
-        fprintf(stderr, "deadlock for sys.stdout, releasing\n");
-        PyThread_release_lock(stdout_lock);
-    }
-
-    if (LOCK_ACQUIRED(stderr_lock)) {
-        // directly write to stderr instead of issuing a warning, as
-        // the warning itself might cause a deadlock.
-        fprintf(stderr, "deadlock for sys.stderr, releasing\n");
-        PyThread_release_lock(stderr_lock);
+        if (LOCK_ACQUIRED(stderr_lock)) {
+            // directly write to stderr instead of issuing a warning, as
+            // the warning itself might cause a deadlock.
+            fprintf(stderr, "deadlock for sys.stderr, releasing\n");
+            PyThread_release_lock(stderr_lock);
+        }
     }
 
     atfork_watchable *current = modstate->watchlist;
@@ -455,8 +463,6 @@ PyObject* deregister_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
 
     Py_RETURN_NONE;
 }
-
-extern PyTypeObject PyTextIOWrapper_Type;
 
 /**
  * Add a `TextIOWrapper` instance to the watchlist.

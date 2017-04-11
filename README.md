@@ -7,8 +7,8 @@ If a process is forked while an io lock is being held, the child process will de
 This is prevented by checking for acquired locks after fork and manually freeing them. This may cause corruption in the
 the file stream as concurrent writes betweeen the two processes are no longer protected.
 
-Note that this has only been tested using Python 3.6 on OSX so far, but it should work on other systems as well 
-(Windows might cause problems, though).
+Note that this has only been tested using Python 3.6 on OSX and 3.4 on Ubuntu so far, but it should work on other 
+systems as well (Windows might cause problems, though).
 
 ## Installation
 

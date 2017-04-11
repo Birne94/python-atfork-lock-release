@@ -14,7 +14,7 @@ typedef off_t Py_off_t;
 typedef struct {
     PyObject_HEAD
 
-            PyObject *raw;
+    PyObject *raw;
     int ok;    /* Initialized? */
     int detached;
     int readable;

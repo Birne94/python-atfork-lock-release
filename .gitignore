@@ -63,3 +63,4 @@ dist
 
 # Virtual environments
 venv
+__pycache__
