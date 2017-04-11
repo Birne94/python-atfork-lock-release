@@ -1,6 +1,11 @@
 #include <Python.h>
-#include "bufferedio_structs.h"
+#include <pythread.h>
+#include "structs.h"
 
+
+#if PY_MAJOR_VERSION != 3
+# error atfork_lock_release only supports python 3 for now
+#endif
 
 #ifndef _POSIX_THREADS
 # error atfork_lock_release requires posix threads to be available
@@ -19,9 +24,6 @@ static struct PyModuleDef atfork_lock_release_module;
 
 /* Helper macros */
 
-#define CHECK_STATUS(name)  if (status != 0) { fprintf(stderr, \
-    "%s: %s\n", name, strerror(status)); error = 1; }
-
 // First field of the pthread lock structure is a char. In order to access it
 // we cast the lock to char* and dereference afterwards.
 #define LOCK_ACQUIRED(_lock) (*((char*)(_lock)))
@@ -29,11 +31,17 @@ static struct PyModuleDef atfork_lock_release_module;
 
 /* Module state */
 
+/**
+ * Linked list node for atfork callbacks
+ */
 typedef struct _atfork_callback {
     PyObject *callback;
     struct _atfork_callback *next;
 } atfork_callback;
 
+/**
+ * Linked list node for watchables (e.g. file streams)
+ */
 typedef struct _atfork_watchable {
     PyObject *item;
     struct _atfork_watchable *next;
@@ -52,7 +60,8 @@ typedef struct {
 
 #define MODULE_STATE(mod) ((module_state*)PyModule_GetState(mod))
 
-/* Callback utils */
+
+/* Callback machinery */
 
 /**
  * Template method for adding atfork callbacks
@@ -60,7 +69,7 @@ typedef struct {
  * @param result Pointer to a result pointer which will store the created callback object
  * @return
  */
-static int add_callback(PyObject *args, atfork_callback **result) {
+static int create_callback(PyObject *args, atfork_callback **result) {
     PyObject *callback;
     atfork_callback *af_callback = NULL;
 
@@ -98,14 +107,17 @@ static PyObject *add_pre_fork_callback(PyObject *self, PyObject *args, PyObject 
     atfork_callback *callback;
     module_state *modstate = MODULE_STATE(self);
 
-    if (add_callback(args, &callback)) {
+    if (create_callback(args, &callback)) {
         return NULL;
     }
 
     callback->next = modstate->callback_pre_fork;
     modstate->callback_pre_fork = callback;
 
-    Py_RETURN_NONE;
+    // Return the function to allow usage as decorator
+    PyObject *func = callback->callback;
+    Py_INCREF(func);
+    return func;
 }
 
 /**
@@ -115,14 +127,17 @@ static PyObject *add_post_fork_parent_callback(PyObject *self, PyObject *args, P
     atfork_callback *callback;
     module_state *modstate = MODULE_STATE(self);
 
-    if (add_callback(args, &callback)) {
+    if (create_callback(args, &callback)) {
         return NULL;
     }
 
     callback->next = modstate->callback_after_fork_parent;
     modstate->callback_after_fork_parent = callback;
 
-    Py_RETURN_NONE;
+    // Return the function to allow usage as decorator
+    PyObject *func = callback->callback;
+    Py_INCREF(func);
+    return func;
 }
 
 /**
@@ -132,14 +147,17 @@ static PyObject *add_post_fork_child_callback(PyObject *self, PyObject *args, Py
     atfork_callback *callback;
     module_state *modstate = MODULE_STATE(self);
 
-    if (add_callback(args, &callback)) {
+    if (create_callback(args, &callback)) {
         return NULL;
     }
 
     callback->next = modstate->callback_after_fork_child;
     modstate->callback_after_fork_child = callback;
 
-    Py_RETURN_NONE;
+    // Return the function to allow usage as decorator
+    PyObject *func = callback->callback;
+    Py_INCREF(func);
+    return func;
 }
 
 /**
@@ -192,42 +210,13 @@ static void clear_callbacks(atfork_callback *callback) {
     }
 }
 
-/**
- * Module cleanup
- */
-static int atfork_clear(PyObject *self) {
-    module_state *modstate = MODULE_STATE(self);
 
-    clear_callbacks(modstate->callback_pre_fork);
-    clear_callbacks(modstate->callback_after_fork_parent);
-    clear_callbacks(modstate->callback_after_fork_child);
-
-    modstate->callback_pre_fork = modstate->callback_after_fork_parent = modstate->callback_after_fork_child = NULL;
-
-    while (modstate->watchlist != NULL) {
-        atfork_watchable *item = modstate->watchlist;
-        modstate->watchlist = item->next;
-
-        Py_DECREF(item->item);
-        PyMem_Free(item);
-    }
-
-    modstate->watchlist = NULL;
-
-    return 0;
-}
+/* Utility */
 
 /**
- * Module cleanup
+ * Obtain the lock instance from a `TextIOWrapper` object.
  */
-static void atfork_free(PyObject *self) {
-    atfork_clear(self);
-}
-
-
-/* Helper functions */
-
-PyThread_type_lock _get_lock_from_textiowrapper(PyObject *object) {
+PyThread_type_lock get_lock_from_textiowrapper(PyObject *object) {
     return ((buffered*) ((textio*) object)->buffer)->lock;
 }
 
@@ -241,7 +230,7 @@ PyThread_type_lock _get_lock_from_textiowrapper(PyObject *object) {
  * @param stderr_lock pointer to a `PyThread_type_lock` instance.
  * @return 0 if all locks could be obtained.
  */
-int _get_io_locks(PyThread_type_lock *stdout_lock, PyThread_type_lock *stderr_lock) {
+int get_io_locks(PyThread_type_lock *stdout_lock, PyThread_type_lock *stderr_lock) {
     PyObject *sys_stdout = PySys_GetObject("stdout");
     if (sys_stdout == NULL || sys_stdout == Py_None) {
         PyErr_SetString(PyExc_RuntimeError, "unable to obtain sys.stdout");
@@ -256,14 +245,14 @@ int _get_io_locks(PyThread_type_lock *stdout_lock, PyThread_type_lock *stderr_lo
 
     // sys.std{out,err} is wrapped in `_io::TextIOWrapper` which contains a pointer
     // to the buffer object itself.
-    *stdout_lock = _get_lock_from_textiowrapper(sys_stdout);
-    *stderr_lock = _get_lock_from_textiowrapper(sys_stderr);
+    *stdout_lock = get_lock_from_textiowrapper(sys_stdout);
+    *stderr_lock = get_lock_from_textiowrapper(sys_stderr);
 
     return 0;
 }
 
 
-/* Module locals */
+/* atfork handlers */
 
 /**
  * pre-fork hook
@@ -281,7 +270,7 @@ void _pre_fork() {
         return;
 
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
-    if (_get_io_locks(&stdout_lock, &stderr_lock)) {
+    if (get_io_locks(&stdout_lock, &stderr_lock)) {
         return;
     }
 
@@ -304,7 +293,7 @@ void _pre_fork() {
 
     atfork_watchable *current = modstate->watchlist;
     while (current != NULL) {
-        PyThread_type_lock lock = _get_lock_from_textiowrapper(current->item);
+        PyThread_type_lock lock = get_lock_from_textiowrapper(current->item);
         if (LOCK_ACQUIRED(lock)) {
             fprintf(stderr, "possible deadlock for file descriptor\n");
         }
@@ -347,7 +336,7 @@ void _after_fork_child() {
         return;
 
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
-    if (_get_io_locks(&stdout_lock, &stderr_lock)) {
+    if (get_io_locks(&stdout_lock, &stderr_lock)) {
         return;
     }
 
@@ -376,7 +365,7 @@ void _after_fork_child() {
 
     atfork_watchable *current = modstate->watchlist;
     while (current != NULL) {
-        PyThread_type_lock lock = _get_lock_from_textiowrapper(current->item);
+        PyThread_type_lock lock = get_lock_from_textiowrapper(current->item);
         if (LOCK_ACQUIRED(lock)) {
             fprintf(stderr, "deadlock for file descriptor\n");
             PyThread_release_lock(lock);
@@ -388,20 +377,18 @@ void _after_fork_child() {
 }
 
 
-/* Method definitions */
+/* Module method definitions */
 
 /**
  * Register the module's atfork hooks.
  */
-PyObject* _register_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
-    int status, error = 0;
+PyObject* register_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
+    int status;
     module_state *modstate = MODULE_STATE(self);
 
     if (! modstate->hooks_registered) {
         status = pthread_atfork(_pre_fork, _after_fork_parent, _after_fork_child);
-        CHECK_STATUS("pthread_atfork");
-
-        if (error) {
+        if (status != 0) {
             PyErr_Format(PyExc_RuntimeError,
                          "Unable to register atfork hooks: %s",
                          strerror(status));
@@ -420,7 +407,7 @@ PyObject* _register_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
 /**
  * Deregister the module's atfork hooks.
  */
-PyObject* _deregister_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
+PyObject* deregister_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
     module_state *modstate = MODULE_STATE(self);
 
     if (! modstate->hooks_registered) {
@@ -438,7 +425,10 @@ PyObject* _deregister_hooks(PyObject *self, PyObject *Py_UNUSED(args)) {
 
 extern PyTypeObject PyTextIOWrapper_Type;
 
-PyObject* _watch_textiowrapper(PyObject *self, PyObject *args, PyObject *Py_UNUSED(kwargs)) {
+/**
+ * Add a `TextIOWrapper` instance to the watchlist.
+ */
+PyObject* watch_textiowrapper(PyObject *self, PyObject *args, PyObject *Py_UNUSED(kwargs)) {
     module_state *modstate = MODULE_STATE(self);
 
     if (PyTuple_GET_SIZE(args) != 1) {
@@ -471,13 +461,45 @@ PyObject* _watch_textiowrapper(PyObject *self, PyObject *args, PyObject *Py_UNUS
 
 /* Module definition */
 
+/**
+ * Module cleanup
+ */
+static int atfork_clear(PyObject *self) {
+    module_state *modstate = MODULE_STATE(self);
+
+    clear_callbacks(modstate->callback_pre_fork);
+    clear_callbacks(modstate->callback_after_fork_parent);
+    clear_callbacks(modstate->callback_after_fork_child);
+
+    modstate->callback_pre_fork = modstate->callback_after_fork_parent = modstate->callback_after_fork_child = NULL;
+
+    while (modstate->watchlist != NULL) {
+        atfork_watchable *item = modstate->watchlist;
+        modstate->watchlist = item->next;
+
+        Py_DECREF(item->item);
+        PyMem_Free(item);
+    }
+
+    modstate->watchlist = NULL;
+
+    return 0;
+}
+
+/**
+ * Module cleanup
+ */
+static void atfork_free(PyObject *self) {
+    atfork_clear(self);
+}
+
 static struct PyMethodDef atfork_lock_release_methods[] = {
-        { "register", (PyCFunction) _register_hooks, METH_NOARGS, "register atfork handlers"},
-        { "deregister", (PyCFunction) _deregister_hooks, METH_NOARGS, "disable atfork handlers"},
-        { "pre_fork", (PyCFunction) add_pre_fork_callback, METH_VARARGS, ""},
-        { "after_fork_parent", (PyCFunction) add_post_fork_parent_callback, METH_VARARGS, ""},
-        { "after_fork_child", (PyCFunction) add_post_fork_child_callback, METH_VARARGS, ""},
-        { "watch", (PyCFunction) _watch_textiowrapper, METH_VARARGS, ""},
+        { "register", (PyCFunction) register_hooks, METH_NOARGS, "register atfork handlers" },
+        { "deregister", (PyCFunction) deregister_hooks, METH_NOARGS, "disable atfork handlers" },
+        { "pre_fork", (PyCFunction) add_pre_fork_callback, METH_VARARGS, "" },
+        { "after_fork_parent", (PyCFunction) add_post_fork_parent_callback, METH_VARARGS, "" },
+        { "after_fork_child", (PyCFunction) add_post_fork_child_callback, METH_VARARGS, "" },
+        { "watch", (PyCFunction) watch_textiowrapper, METH_VARARGS, "" },
         { NULL }
 };
 

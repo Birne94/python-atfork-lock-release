@@ -18,9 +18,10 @@ Install from source using
 python setup.py install
 ```
 
-## Usage
+## Preventing I/O deadlocks
 
-Enable the atfork hooks through `register` 
+The module provides hooks in order to prevent deadlocks while forking. The hooks can be enabled for `stdout`/`stderr` 
+through `register()`. 
 
 ```python
 import atfork_lock_release
@@ -35,3 +36,49 @@ atfork_lock_release.deregister()
 
 While this keeps the atfork handlers in place (there is no removing counterpart to `pthread_atfork`), they are disabled
 until `register` is called again.
+
+File handles might cause deadlocks as well, they can be monitored through `watch()`:
+
+```python
+fs = open('foo.bar', 'w')
+atfork_lock_release.watch(fs)
+```
+
+Note that depending on the platform and usage the file contents might get corrupted by concurrent writes, so only use 
+with caution. Currently, only text-mode files are supported (opened _without_ the `b` flag).
+
+## Custom atfork-hooks
+
+The module provides an api for adding custom pre- and post-fork hooks:
+
+```python
+import atfork_lock_release
+import os
+
+
+def main():
+    pid = os.fork()
+    print("fork:", pid)
+
+
+@atfork_lock_release.pre_fork
+def pre_fork():
+    print("pre-fork", os.getpid())
+
+
+@atfork_lock_release.after_fork_parent
+def after_fork_parent():
+    print("parent", os.getpid())
+
+
+@atfork_lock_release.after_fork_child
+def after_fork_child():
+    print("child", os.getpid())
+
+
+if __name__ == '__main__':
+    atfork_lock_release.register()
+    main()
+```
+
+Multiple handlers for each hooks can be registered, the most recently registered one will be called first.

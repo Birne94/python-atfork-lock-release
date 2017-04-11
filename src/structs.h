@@ -3,11 +3,8 @@
  * structure cannot be accessed from within our module.
  *
  * Note that this structure needs to be adapted in case the struct changes in
- * upstream. Current reference is cpython::master at ad2f9e2.
+ * upstream.
  */
-
-#ifndef PYTHON_ATFORK_LOCK_RELEASE_BUFFEREDIO_STRUCTS_H
-#define PYTHON_ATFORK_LOCK_RELEASE_BUFFEREDIO_STRUCTS_H
 
 #include <Python.h>
 #include <pythread.h>
@@ -65,8 +62,6 @@ typedef struct
     int detached;
     Py_ssize_t chunk_size;
     PyObject *buffer;
+
+    /* other fields are not needed */
 } textio;
-
-
-
-#endif //PYTHON_ATFORK_LOCK_RELEASE_BUFFEREDIO_STRUCTS_H
