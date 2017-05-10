@@ -335,11 +335,11 @@ void _pre_fork(void) {
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
     if (! get_io_locks(&stdout_lock, &stderr_lock)) {
         if (stdout_lock == NULL) {
-            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stdout lock");
+            PyErr_WarnEx(PyExc_RuntimeWarning, "unable to obtain stdout lock", 1);
             return;
         }
         if (stderr_lock == NULL) {
-            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stderr lock");
+            PyErr_WarnEx(PyExc_RuntimeWarning, "unable to obtain stderr lock", 1);
             return;
         }
 
@@ -399,11 +399,11 @@ void _after_fork_child(void) {
     PyThread_type_lock stdout_lock, stderr_lock = NULL;
     if (! get_io_locks(&stdout_lock, &stderr_lock)) {
         if (stdout_lock == NULL) {
-            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stdout lock");
+            PyErr_WarnEx(PyExc_RuntimeWarning, "unable to obtain stdout lock", 1);
             return;
         }
         if (stderr_lock == NULL) {
-            PyErr_SetString(PyExc_RuntimeError, "unable to obtain stderr lock");
+            PyErr_WarnEx(PyExc_RuntimeWarning, "unable to obtain stderr lock", 1);
             return;
         }
 
